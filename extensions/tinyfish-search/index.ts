@@ -1,11 +1,10 @@
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { TinyFish, type SearchResult } from "@tiny-fish/sdk";
+import type { SearchQueryParams } from "@tiny-fish/sdk";
+import { Cause, Effect, Exit } from "effect";
 import { Type } from "typebox";
 
+import { TinyFishSearch } from "./client.ts";
+import { formatResponse } from "./format.ts";
 import {
   SEARCH_PARAMETER_DESCRIPTIONS,
   SEARCH_PROMPT_GUIDELINES,
@@ -13,75 +12,31 @@ import {
   SEARCH_TOOL_DESCRIPTION,
 } from "./prompt.ts";
 
-function readEnvValue(name: string) {
-  if (process.env[name]) return process.env[name];
+const search = Effect.fn("tinyfish-search.search")(function* (params: SearchQueryParams) {
+  const tinyfish = yield* TinyFishSearch;
+  const response = yield* tinyfish.query(params);
 
-  const envPath = join(homedir(), ".pi", "agent", ".env");
-  let envText = "";
+  return {
+    content: [{ type: "text" as const, text: formatResponse(response) }],
+    structuredContent: {
+      query: response.query,
+      page: response.page,
+      total_results: response.total_results,
+      results: response.results,
+    },
+    details: { query: response.query, count: response.results.length, page: response.page },
+  };
+});
 
-  try {
-    envText = readFileSync(envPath, "utf8");
-  } catch {
-    return undefined;
-  }
-
-  for (const line of envText.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-
-    const match = trimmed.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!match || match[1] !== name) continue;
-
-    const value = match[2].trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      return value.slice(1, -1);
-    }
-
-    return value.replace(/\s+#.*$/, "");
-  }
-
-  return undefined;
-}
-
-function getClient(): TinyFish {
-  const apiKey = readEnvValue("TINYFISH_API_KEY");
-  if (!apiKey) {
-    throw new Error(
-      "TINYFISH_API_KEY is not set. Create a key at https://agent.tinyfish.ai/api-keys and export it.",
-    );
-  }
-  return new TinyFish({
-    apiKey,
-  });
-}
-
-function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
-  if (!signal) return promise;
-  if (signal.aborted) return Promise.reject(new Error("Search aborted"));
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(new Error("Search aborted"));
-    signal.addEventListener("abort", onAbort, { once: true });
-    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
-  });
-}
-
-function formatResult(r: SearchResult): string {
-  const meta = [
-    r.publisher ?? r.site_name,
-    r.date,
-    r.authors?.length ? r.authors.join(", ") : undefined,
-    r.venue,
-    r.year?.toString(),
-    r.cited_by_count !== undefined ? `cited by ${r.cited_by_count}` : undefined,
-  ].filter(Boolean);
-  const lines = [`${r.position}. ${r.title}`, `   ${r.url}`];
-  if (meta.length) lines.push(`   ${meta.join(" · ")}`);
-  if (r.pdf_url) lines.push(`   PDF: ${r.pdf_url}`);
-  if (r.snippet) lines.push(`   ${r.snippet.replace(/\s+/g, " ").trim()}`);
-  return lines.join("\n");
+/**
+ * Runs the effect at the pi boundary. Aborting `signal` interrupts the fiber;
+ * typed failures are rethrown so pi reports them as failed tool results.
+ */
+async function runTool<A, E>(effect: Effect.Effect<A, E>, signal: AbortSignal | undefined) {
+  const exit = await Effect.runPromiseExit(effect, { signal });
+  if (Exit.isSuccess(exit)) return exit.value;
+  if (Cause.hasInterruptsOnly(exit.cause)) throw new Error("Search aborted");
+  throw Cause.squash(exit.cause);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -130,24 +85,10 @@ export default function (pi: ExtensionAPI) {
       idempotentHint: true,
     },
 
-    async execute(_toolCallId, params, signal) {
-      const response = await abortable(getClient().search.query(params), signal);
-
-      const header = `TinyFish search: "${response.query}" — ${response.results.length} results (page ${response.page})`;
-      const body = response.results.length
-        ? response.results.map(formatResult).join("\n\n")
-        : "No results found.";
-
-      return {
-        content: [{ type: "text", text: `${header}\n\n${body}` }],
-        structuredContent: {
-          query: response.query,
-          page: response.page,
-          total_results: response.total_results,
-          results: response.results,
-        },
-        details: { query: response.query, count: response.results.length, page: response.page },
-      };
+    execute(_toolCallId, params, signal) {
+      // Entry point: the layer is built per call so API key changes are picked up without a reload.
+      // oxlint-disable-next-line effecttsgo/strict-effect-provide
+      return runTool(search(params).pipe(Effect.provide(TinyFishSearch.layer)), signal);
     },
   });
 }

@@ -4,6 +4,7 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "noEmit": true,
+    "plugins": [{ "name": "@effect/language-service", "diagnostics": false }],
     "skipLibCheck": true,
     "strict": true,
     "target": "ES2022",
